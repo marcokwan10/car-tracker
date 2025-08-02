@@ -6,6 +6,7 @@ import os
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
+from datetime import datetime
 
 load_dotenv()  # Load .env file
 
@@ -27,6 +28,17 @@ def extract_price_and_status(text):
     return None, None
 
 
+def parse_sold_date(date_str):
+    if not date_str:
+        return None
+    for fmt in ["%m/%d/%y", "%b %d, %Y"]:  # handle "8/1/25" and "Aug 1, 2025"
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def parse_mileage_string(raw: str) -> int | None:
     """
     Converts a raw mileage string (like '19K', '19,500', '19.5k', '19k-Mile') to an integer mileage.
@@ -36,49 +48,53 @@ def parse_mileage_string(raw: str) -> int | None:
         return None
 
     # Normalize to lowercase, remove spaces and commas
-    s = raw.lower().replace(",", "").replace(" ", "")
+    s = raw.lower().replace(",", "").strip()
     s = s.replace("-mile", "").replace("mile", "")  # remove '-mile' or 'mile'
 
-    # Regex to capture patterns like 19k, 19.5k, 19500
-    match = re.match(r"(\d+(?:\.\d+)?)(k)?$", s)
-    if not match:
+    if s.endswith("k"):
+        try:
+            return int(float(s[:-1]) * 1000)
+        except ValueError:
+            return None
+    try:
+        return int(float(s))
+    except ValueError:
         return None
-
-    num = float(match.group(1))
-    if match.group(2):  # has 'k'
-        return int(num * 1000)
-    return int(num)
 
 
 def extract_mileage(text: str) -> int | None:
     """
-    Scans a title or excerpt for the *most likely odometer reading*.
-    Returns the highest mileage found, assuming that's the car's total mileage.
+    Extracts the highest plausible odometer reading from string.
+    Only matches values with a 'k' suffix or those explicitly followed by 'mile'/'miles'.
     """
     if not text:
         return None
 
-    # Find mileage patterns in the text
-    mileage_candidates = re.findall(
-        r"(\d{1,3}(?:[.,]\d{3})?|[\d.]+k)\s*(?:-?mile|miles)?",
-        text,
-        flags=re.IGNORECASE,
-    )
+    # Normalize text to lowercase for consistent matching
+    text_norm = text.lower()
+
+    # Match either:
+    # - numbers with 'k' (e.g. '15k')
+    # - numbers followed by 'mile' or 'miles' (e.g. '200 miles', '2,900-Mile')
+    pattern = re.compile(r"\b(\d+(?:\.\d+)?k)\b|\b(\d{1,3}(?:[.,]\d{3})*)(?=\s*miles?\b)", re.IGNORECASE)
+    matches = pattern.findall(text_norm)
+
+    # Flatten capture groups into raw strings
+    candidates = [m[0] or m[1] for m in matches]
 
     mile_values = []
-    for candidate in mileage_candidates:
-        miles = parse_mileage_string(candidate)
+    for raw in candidates:
+        miles = parse_mileage_string(raw)
         if miles is not None:
             mile_values.append(miles)
 
-    if not mile_values:
-        return None
-
-    # Heuristic: total odometer is usually the highest number mentioned
-    return max(mile_values)
+    return max(mile_values) if mile_values else None
 
 
 async def extract_mileage_from_detail_page(session: aiohttp.ClientSession, url: str):
+    """
+    Extract mileage from the 'Listing Details' section of a vehicle page.
+    """
     async with session.get(url) as response:
         html = await response.text()
 
@@ -101,15 +117,15 @@ async def extract_mileage_from_detail_page(session: aiohttp.ClientSession, url: 
     if not ul:
         return None
 
+    # Only parse items explicitly mentioning mileage
     for li in ul.find_all("li"):
         text = li.get_text(strip=True)
-        match = re.search(r"(\d{1,3}(?:[,\.]?\d{3})?k?)\s*miles", text, re.IGNORECASE)
-        if match:
-            mileage_str = match.group(1).lower().replace(",", "").replace(".", "")
-            if "k" in mileage_str:
-                return int(float(mileage_str.replace("k", "")) * 1000)
-            else:
-                return int(mileage_str)
+        # Only parse items explicitly mentioning mileage
+        if "mile" not in text.lower():
+            continue
+        mileage = extract_mileage(text)
+        if mileage is not None:
+            return mileage
 
     return None
 
@@ -133,27 +149,24 @@ async def parse_vehicle_listing(listing, session: aiohttp.ClientSession):
     model = vehicle_title_match.group("model")
     original_owner = "original-owner" in title.lower()
 
-    # Try to extract mileage from title/excerpt
+    # Mileage priority: title > excerpt > detail page
     mileage = extract_mileage(title) or extract_mileage(excerpt)
-
-    # If still no mileage, fetch from detail page
     if mileage is None and url:
-        try:
-            mileage = await extract_mileage_from_detail_page(session, url)
-        except Exception as e:
-            print(f"Failed to fetch detail page for {url}: {e}")
+        mileage = await extract_mileage_from_detail_page(session, url)
 
     result_el = listing.select_one(".item-results")
     result_text = result_el.text.strip() if result_el else ""
-    result_date = (
+    result_date_str = (
         result_el.select_one("span").text.strip().replace("on ", "")
         if result_el and result_el.select_one("span")
         else None
     )
+    result_date = parse_sold_date(result_date_str)
 
     price, status = extract_price_and_status(result_text)
 
     return {
+        "url": url,
         "title": title,
         "year": year,
         "make": make,
@@ -164,11 +177,10 @@ async def parse_vehicle_listing(listing, session: aiohttp.ClientSession):
         "sold_date": result_date,
         "status": status,
         "excerpt": excerpt,
-        "url": url,
     }
 
 
-async def scrape_bring_a_trailer(url: str, max_clicks: int = 20):
+async def scrape_bring_a_trailer(url: str, max_clicks: int = 100):
     """
     Scrapes Bring a Trailer listings by repeatedly clicking the "Show More" button.
     Uses a more efficient by waiting for new listings to appear rather than a fixed timeout.
@@ -189,38 +201,33 @@ async def scrape_bring_a_trailer(url: str, max_clicks: int = 20):
 
             # Find the completed auctions 'Show More' button
             show_more_selectors = [
-                # New footer button
-                ".auctions-container.column-limited-width .auctions-footer-button",
-                # ".auctions-completed.page-section .auctions-footer-button",
-                # Legacy button style
-                # ".auctions-container.column-limited-width .button-show-more",
-                # ".auctions-completed.page-section .button-show-more",
+                ".auctions-container.column-limited-width .auctions-footer-button",  # for all auction result
+                ".auctions-completed.page-section .button-show-more",  # for individual model auction result
             ]
 
             show_more = None
             for selector in show_more_selectors:
                 show_more = await page.query_selector(selector)
-                if show_more:
+                # Ensure it's visible
+                if show_more and await show_more.is_visible():
                     break
 
             if not show_more:
-                print("No more 'Show More' button found.")
+                print("No visible 'Show More' button found. Stopping.")
                 break
 
             try:
+                # Scroll into view and click
+                await show_more.scroll_into_view_if_needed()
                 await show_more.click()
                 click_count += 1
                 print(f"Clicked 'Show More' #{click_count}, current listings: {current_count}")
 
-                # Wait for new items to load by checking if the count increases
-                for _ in range(30):  # up to 30 * 0.5s = 15 seconds max
-                    await page.wait_for_timeout(500)
-                    new_count = len(await page.query_selector_all("a.listing-card"))
-                    if new_count > current_count:
-                        # New listings loaded, break inner loop
-                        break
-                else:
-                    print("No new listings detected, stopping.")
+                # Wait for the next listing to appear after click
+                try:
+                    await page.wait_for_selector(f"a.listing-card:nth-child({current_count+1})", timeout=20000)
+                except:
+                    print("No new listings detected after clicking. Stopping.")
                     break
 
             except Exception as e:
@@ -238,8 +245,10 @@ async def scrape_bring_a_trailer(url: str, max_clicks: int = 20):
 
     # Open aiohttp session for detail page mileage lookup
     async with aiohttp.ClientSession() as session:
-        for listing in listings:
-            parsed = await parse_vehicle_listing(listing, session)
+        # Run detail page parsing concurrently for speed
+        tasks = [parse_vehicle_listing(listing, session) for listing in listings]
+        parsed_list = await asyncio.gather(*tasks)
+        for parsed in parsed_list:
             if parsed:
                 results.append(parsed)
 
@@ -268,7 +277,7 @@ async def save_to_db(records):
                 r["make"],
                 r["model"],
                 r["original_owner"],
-                r["mileage"],
+                r["mileage"] if r["mileage"] is not None else None,  # NULL if missing
                 r["sold_price"],
                 r["sold_date"],
                 r["status"],
@@ -279,14 +288,13 @@ async def save_to_db(records):
 
 
 async def main():
-    url = "https://bringatrailer.com/auctions/results/"
+    url = "https://bringatrailer.com/porsche/997-gt3/"
     results = await scrape_bring_a_trailer(url)
-    print(results[0])
-    print(results[-1])
+
     print(f"Scraped {len(results)} listings")
-    # if results:
-    #     await save_to_db(results)
-    #     print("Saved to database!")
+    if results:
+        await save_to_db(results)
+        print("Saved to database!")
 
 
 if __name__ == "__main__":
