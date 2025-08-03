@@ -3,12 +3,147 @@ import aiohttp
 import asyncpg
 import re
 import os
+import json
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
 from datetime import datetime
+import google.generativeai as genai
 
 load_dotenv()  # Load .env file
+
+try:
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+except KeyError:
+    print("FATAL: Please set the 'GEMINI_API_KEY' environment variable.")
+    exit(1)
+
+KNOWN_MAKES = [
+    # Multi-word and longer names prioritized
+    "Gordon Murray Automotive",
+    "Mercedes-Benz",
+    "Harley-Davidson",
+    "BMW Motorrad",
+    "Land Rover",
+    "Morgan Aeromax",
+    "Morgan SuperSport",
+    "Rolls-Royce",
+    "Mercedes-AMG",
+    # Hypercar/hyper-specialist brands
+    "Bugatti",
+    "Koenigsegg",
+    "Pagani",
+    "Rimac",
+    "Hennessey",
+    "GMA",
+    # Car manufacturers (current brands from Wikipedia)
+    "Acura",
+    "Abarth",
+    "Alfa Romeo",
+    "Alpina",
+    "Alpine",
+    "Aston Martin",
+    "Audi",
+    "Bentley",
+    "BMW",
+    "BYD",
+    "Cadillac",
+    "Chevrolet",
+    "Chrysler",
+    "Citroën",
+    "Dacia",
+    "Daewoo",
+    "Daihatsu",
+    "Dodge",
+    "Donkervoort",
+    "DS",
+    "Ferrari",
+    "Fiat",
+    "Fisker",
+    "Ford",
+    "Genesis",
+    "Honda",
+    "Hummer",
+    "Hyundai",
+    "Infiniti",
+    "Iveco",
+    "Jaguar",
+    "Jeep",
+    "Kia",
+    "KTM",
+    "Lada",
+    "Lamborghini",
+    "Lancia",
+    "Landwind",
+    "Lexus",
+    "Lucid",
+    "Lotus",
+    "Maserati",
+    "Maybach",
+    "Mazda",
+    "McLaren",
+    "Mercedes",
+    "Mini",
+    "Mitsubishi",
+    "Morgan",
+    "Nissan",
+    "Opel",
+    "Peugeot",
+    "Plymouth" "Polestar",
+    "Pontiac",
+    "Porsche",
+    "Ram",
+    "Renault",
+    "Rivian",
+    "Rolls-Royce",
+    "Rover",
+    "Saab",
+    "Saturn",
+    "Scion",
+    "Seat",
+    "Skoda",
+    "Smart",
+    "SsangYong",
+    "Subaru",
+    "Suzuki",
+    "Tata",
+    "Tesla",
+    "Toyota",
+    "Volkswagen",
+    "Volvo",
+    "International",
+    "Mercury",
+    "GMC",
+    # Motorcycle manufacturers (major current)
+    "Aprilia",
+    "Benelli",
+    "Bimota",
+    "BMW Motorrad",
+    "Ducati",
+    "Harley-Davidson",
+    "Hero MotoCorp",
+    "Husqvarna",
+    "Indian",
+    "Kawasaki",
+    "KTM",
+    "Moto Guzzi",
+    "MV Agusta",
+    "Piaggio",
+    "Royal Enfield",
+    "Suzuki",
+    "Triumph",
+    "TVS",
+    "Vespa",
+    "Yamaha",
+    "Zero Motorcycles",
+    "BSA",
+]
+
+# Normalize sub-brands or alternate names to canonical make
+MAKE_NORMALIZATION = {
+    "Mercedes-AMG": "Mercedes-Benz",
+    "GMA": "Gordon Murray Automotive",
+}
 
 DB_CONFIG = {
     "user": os.getenv("DB_USER"),
@@ -17,6 +152,71 @@ DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
     "port": int(os.getenv("DB_PORT", 5432)),
 }
+
+
+async def split_make_model(raw_title: str) -> tuple[str, str]:
+    """
+    raw_title = e.g. "2021 Land Rover Range Rover Evoque"
+    returns ("Land Rover", "Range Rover Evoque")
+    """
+
+    # Remove common non-make prefixes
+    title = re.sub(
+        r"^(One-Owner|Original-Owner|Modified|Supercharged|Turbocharged|Custom|JDM)\s+",
+        "",
+        raw_title,
+        flags=re.IGNORECASE,
+    )
+
+    # strip off year and mileage
+    # e.g. turn "15k-Mile 2021 Land Rover…" into "Land Rover Range Rover Evoque"
+    stripped_title = re.sub(r"^(?:[\d.,kK-]+-Mile\s+)?(?:19|20)\d{2}\s+", "", title).strip()
+
+    # find known make
+    for make in KNOWN_MAKES:
+        if stripped_title.startswith(make + " "):
+            model = stripped_title[len(make) :].strip()
+            normalized_make = MAKE_NORMALIZATION.get(make, make)
+            return normalized_make, model
+
+    # fallback to use ai if no known make was found
+    result = await ai_extract_make_model(raw_title)
+    return result if result else (None, None)
+
+
+async def ai_extract_make_model(raw_title: str) -> tuple[str, str]:
+    """
+    Use Google Gemini to extract the vehicle make and model from the title.
+    Only used as a fallback when deterministic extraction fails.
+    """
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash-lite",
+        generation_config={"response_mime_type": "application/json"},
+    )
+
+    prompt = f"""
+    You are an expert vehicle information extractor.
+    From the car title below, extract the make and the model.
+    Return the output as a JSON object with two keys: "make" and "model".
+
+    If the title does not seem to be for a vehicle, return a JSON object where both "make" and "model" are null.
+
+    Title: "{raw_title}"
+    """
+    try:
+        response = await model.generate_content_async(prompt)
+
+        # The API's JSON mode directly provides the parsed JSON in the response text
+        result = json.loads(response.text)
+
+        if result is None:
+            return None, None
+
+        return result.get("make"), result.get("model")
+
+    except Exception as e:
+        print(f"An error occurred during Gemini API call: {e}")
+        return None, None
 
 
 def extract_price_and_status(text):
@@ -137,16 +337,17 @@ async def parse_vehicle_listing(listing, session: aiohttp.ClientSession):
     excerpt = excerpt_el.text.strip() if excerpt_el else ""
     url = listing.get("href")
 
-    vehicle_title_match = re.match(
-        r"(?:[\d.,kK\-]+-Mile\s+)?(?:Original-Owner,?\s+)?(?P<year>19\d{2}|20\d{2})\s+(?P<make>[A-Z][a-zA-Z]+)\s+(?P<model>[A-Z0-9][\w\-]+(?:\s+\w+)*)",
-        title,
-    )
-    if not vehicle_title_match:
-        return None  # skip non-car listings
+    # --- Extract year ---
+    year_match = re.search(r"(?:19\d{2}|20\d{2})", title)
+    year = int(year_match.group(0)) if year_match else None
+    if not year:
+        return None  # Skip listing with no year.
 
-    year = int(vehicle_title_match.group("year"))
-    make = vehicle_title_match.group("make")
-    model = vehicle_title_match.group("model")
+    # --- Hybrid make/model extraction ---
+    make, model = await split_make_model(title)
+    if not make or not model:
+        return None  # Skip non-vehicle listings like wheels, hardtops, etc.
+
     original_owner = "original-owner" in title.lower()
 
     # Mileage priority: title > excerpt > detail page
@@ -180,7 +381,7 @@ async def parse_vehicle_listing(listing, session: aiohttp.ClientSession):
     }
 
 
-async def scrape_bring_a_trailer(url: str, max_clicks: int = 100):
+async def scrape_bring_a_trailer(url: str, max_clicks: int = 10):
     """
     Scrapes Bring a Trailer listings by repeatedly clicking the "Show More" button.
     Uses a more efficient by waiting for new listings to appear rather than a fixed timeout.
@@ -288,7 +489,7 @@ async def save_to_db(records):
 
 
 async def main():
-    url = "https://bringatrailer.com/porsche/997-gt3/"
+    url = "https://bringatrailer.com/auctions/results/"
     results = await scrape_bring_a_trailer(url)
 
     print(f"Scraped {len(results)} listings")
