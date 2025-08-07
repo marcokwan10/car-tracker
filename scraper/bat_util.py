@@ -1,0 +1,353 @@
+import asyncio
+from datetime import datetime
+import json
+import os
+import re
+import time
+from aiohttp import ClientTimeout
+import aiohttp
+from bs4 import BeautifulSoup
+import google.generativeai as genai
+
+KNOWN_MAKES = [
+    # Multi-word and longer names prioritized
+    "Gordon Murray Automotive",
+    "Mercedes-Benz",
+    "Harley-Davidson",
+    "BMW Motorrad",
+    "Land Rover",
+    "Morgan Aeromax",
+    "Morgan SuperSport",
+    "Rolls-Royce",
+    "Mercedes-AMG",
+    # Hypercar/hyper-specialist brands
+    "Bugatti",
+    "Koenigsegg",
+    "Pagani",
+    "Rimac",
+    "Hennessey",
+    "GMA",
+    # Car manufacturers (current brands from Wikipedia)
+    "Acura",
+    "Abarth",
+    "Alfa Romeo",
+    "Alpina",
+    "Alpine",
+    "Aston Martin",
+    "Audi",
+    "Bentley",
+    "BMW",
+    "BYD",
+    "Cadillac",
+    "Chevrolet",
+    "Chrysler",
+    "Citroën",
+    "Dacia",
+    "Daewoo",
+    "Daihatsu",
+    "Dodge",
+    "Donkervoort",
+    "DS",
+    "Ferrari",
+    "Fiat",
+    "Fisker",
+    "Ford",
+    "Genesis",
+    "Honda",
+    "Hummer",
+    "Hyundai",
+    "Infiniti",
+    "Iveco",
+    "Jaguar",
+    "Jeep",
+    "Kia",
+    "KTM",
+    "Lada",
+    "Lamborghini",
+    "Lancia",
+    "Landwind",
+    "Lexus",
+    "Lucid",
+    "Lotus",
+    "Maserati",
+    "Maybach",
+    "Mazda",
+    "McLaren",
+    "Mercedes",
+    "Mini",
+    "Mitsubishi",
+    "Morgan",
+    "Nissan",
+    "Opel",
+    "Peugeot",
+    "Plymouth" "Polestar",
+    "Pontiac",
+    "Porsche",
+    "Ram",
+    "Renault",
+    "Rivian",
+    "Rolls-Royce",
+    "Rover",
+    "Saab",
+    "Saturn",
+    "Scion",
+    "Seat",
+    "Skoda",
+    "Smart",
+    "SsangYong",
+    "Subaru",
+    "Suzuki",
+    "Tata",
+    "Tesla",
+    "Toyota",
+    "Volkswagen",
+    "Volvo",
+    "International",
+    "Mercury",
+    "GMC",
+    # Motorcycle manufacturers (major current)
+    "Aprilia",
+    "Benelli",
+    "Bimota",
+    "BMW Motorrad",
+    "Ducati",
+    "Harley-Davidson",
+    "Hero MotoCorp",
+    "Husqvarna",
+    "Indian",
+    "Kawasaki",
+    "KTM",
+    "Moto Guzzi",
+    "MV Agusta",
+    "Piaggio",
+    "Royal Enfield",
+    "Suzuki",
+    "Triumph",
+    "TVS",
+    "Vespa",
+    "Yamaha",
+    "Zero Motorcycles",
+    "BSA",
+]
+
+# Normalize sub-brands or alternate names to canonical make
+MAKE_NORMALIZATION = {
+    "Mercedes-AMG": "Mercedes-Benz",
+    "GMA": "Gordon Murray Automotive",
+}
+
+# Cache AI results to avoid duplicate API calls
+_ai_make_model_cache: dict[str, tuple[str, str] | None] = {}
+
+# Rate limiting parameters for Gemini (requests per minute)
+_GEMINI_RATE_LIMIT_RPM = int(os.getenv("GEMINI_RATE_LIMIT_RPM", "3500"))
+_gemini_interval = 60.0 / _GEMINI_RATE_LIMIT_RPM
+_gemini_last_call = 0.0
+
+# Count how many times AI fallback is invoked
+_ai_fallback_count = 0
+
+
+async def _throttle_gemini_call():
+    """
+    Ensures we do not exceed the configured Gemini RPM by spacing calls.
+    """
+    global _gemini_last_call
+    now = time.monotonic()
+    wait = _gemini_interval - (now - _gemini_last_call)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _gemini_last_call = time.monotonic()
+
+
+async def split_make_model(raw_title: str) -> tuple[str, str]:
+    """
+    raw_title = e.g. "2021 Land Rover Range Rover Evoque"
+    returns ("Land Rover", "Range Rover Evoque")
+    """
+
+    # Remove common non-make prefixes
+    title = re.sub(
+        r"^(One-Owner|Original-Owner|Modified|Supercharged|Turbocharged|Custom|JDM)\s+",
+        "",
+        raw_title,
+        flags=re.IGNORECASE,
+    )
+
+    # strip off year and mileage
+    # e.g. turn "15k-Mile 2021 Land Rover…" into "Land Rover Range Rover Evoque"
+    stripped_title = re.sub(r"^(?:[\d.,kK-]+-Mile\s+)?(?:19|20)\d{2}\s+", "", title).strip()
+
+    # find known make
+    for make in KNOWN_MAKES:
+        if stripped_title.startswith(make + " "):
+            model = stripped_title[len(make) :].strip()
+            normalized_make = MAKE_NORMALIZATION.get(make, make)
+            return normalized_make, model
+
+    # fallback to use ai if no known make was found
+    result = await ai_extract_make_model(raw_title)
+    return result if result else (None, None)
+
+
+async def ai_extract_make_model(raw_title: str) -> tuple[str, str]:
+    """
+    Use Google Gemini to extract the vehicle make and model from the title.
+    Only used as a fallback when deterministic extraction fails.
+    """
+    global _ai_fallback_count
+    _ai_fallback_count += 1
+    # Return cached result if available
+    if raw_title in _ai_make_model_cache:
+        return _ai_make_model_cache[raw_title] or (None, None)
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash-lite",
+        generation_config={"response_mime_type": "application/json"},
+    )
+    prompt = f"""
+    You are an expert vehicle information extractor.
+    From the car title below, extract the make and the model.
+    Return the output as a JSON object with two keys: "make" and "model".
+
+    If the title does not seem to be for a vehicle, return a JSON object where both "make" and "model" are null.
+
+    Title: "{raw_title}"
+    """
+    try:
+        await _throttle_gemini_call()
+        response = await model.generate_content_async(prompt)
+        # Parse JSON from response text
+        parsed = json.loads(response.text)
+        # If it's a list, take the first element
+        if isinstance(parsed, list) and parsed:
+            data = parsed[0]
+        elif isinstance(parsed, dict):
+            data = parsed
+        else:
+            data = {}
+        result_tuple = (data.get("make"), data.get("model"))
+        _ai_make_model_cache[raw_title] = result_tuple
+        return result_tuple
+    except Exception as e:
+        print(f"An error occurred during Gemini API call: {e}")
+        _ai_make_model_cache[raw_title] = (None, None)
+        return None, None
+
+
+def extract_price_and_status(text):
+    match = re.search(r"(Sold for|Bid to) USD \$([\d,]+)", text)
+    if match:
+        status = "sold" if match.group(1) == "Sold for" else "reserve_not_met"
+        price = int(match.group(2).replace(",", ""))
+        return price, status
+    return None, None
+
+
+def parse_mileage_string(raw: str) -> int | None:
+    """
+    Converts a raw mileage string (like '19K', '19,500', '19.5k', '19k-Mile') to an integer mileage.
+    Returns None if it cannot be parsed.
+    """
+    if not raw:
+        return None
+
+    # Normalize to lowercase, remove spaces and commas
+    s = raw.lower().replace(",", "").strip()
+    s = s.replace("-mile", "").replace("mile", "")  # remove '-mile' or 'mile'
+
+    if s.endswith("k"):
+        try:
+            return int(float(s[:-1]) * 1000)
+        except ValueError:
+            return None
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
+
+
+def extract_mileage(text: str) -> int | None:
+    """
+    Extracts the highest plausible odometer reading from string.
+    Only matches values with a 'k' suffix or those explicitly followed by 'mile'/'miles'.
+    """
+    if not text:
+        return None
+
+    # Normalize text to lowercase for consistent matching
+    text_norm = text.lower()
+
+    # Match either:
+    # - numbers with 'k' (e.g. '15k')
+    # - numbers followed by 'mile' or 'miles' (e.g. '200 miles', '2,900-Mile')
+    pattern = re.compile(r"\b(\d+(?:\.\d+)?k)\b|\b(\d{1,3}(?:[.,]\d{3})*)(?=\s*miles?\b)", re.IGNORECASE)
+    matches = pattern.findall(text_norm)
+
+    # Flatten capture groups into raw strings
+    candidates = [m[0] or m[1] for m in matches]
+
+    mile_values = []
+    for raw in candidates:
+        miles = parse_mileage_string(raw)
+        if miles is not None:
+            mile_values.append(miles)
+
+    return max(mile_values) if mile_values else None
+
+
+async def extract_mileage_from_detail_page(session: aiohttp.ClientSession, url: str):
+    """
+    Extract mileage from the 'Listing Details' section of a vehicle page.
+    """
+    try:
+        # Use a 10-second timeout for detail page requests
+        async with session.get(url, timeout=ClientTimeout(total=10)) as response:
+            html = await response.text()
+    except aiohttp.client_exceptions.TooManyRedirects:
+        print(f"Skipping detail page due to redirect loop: {url}")
+        return None
+    except asyncio.TimeoutError:
+        print(f"Skipping detail page due to timeout: {url}")
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Find <div class="item"> that has a <strong>Listing Details</strong> in it
+    detail_sections = soup.find_all("div", class_="item")
+    listing_section = None
+    for section in detail_sections:
+        strong = section.find("strong")
+        if strong and "Listing Details" in strong.text:
+            listing_section = section
+            break
+
+    if not listing_section:
+        return None
+
+    # Look for <ul><li> items after that
+    ul = listing_section.find("ul")
+    if not ul:
+        return None
+
+    # Only parse items explicitly mentioning mileage
+    for li in ul.find_all("li"):
+        text = li.get_text(strip=True)
+        # Only parse items explicitly mentioning mileage
+        if "mile" not in text.lower():
+            continue
+        mileage = extract_mileage(text)
+        if mileage is not None:
+            return mileage
+
+    return None
+
+
+def parse_sold_date(date_str):
+    if not date_str:
+        return None
+    for fmt in ["%m/%d/%y", "%b %d, %Y"]:  # handle "8/1/25" and "Aug 1, 2025"
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
