@@ -16,24 +16,8 @@ from bat_util import (
     extract_mileage_from_detail_page,
     extract_price_and_status,
     parse_sold_date,
+    save_to_db,
 )
-
-load_dotenv()  # Load .env file
-
-try:
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-except KeyError:
-    print("FATAL: Please set the 'GEMINI_API_KEY' environment variable.")
-    exit(1)
-
-
-DB_CONFIG = {
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "database": os.getenv("DB_NAME"),
-    "host": os.getenv("DB_HOST"),
-    "port": int(os.getenv("DB_PORT", 5432)),
-}
 
 
 async def parse_vehicle_listing(listing, session: aiohttp.ClientSession):
@@ -163,38 +147,6 @@ async def scrape_bring_a_trailer(url: str, max_clicks: int = 400):
                 results.append(parsed)
 
     return results
-
-
-async def save_to_db(records):
-    conn = await asyncpg.connect(**DB_CONFIG)
-    try:
-        for r in records:
-            await conn.execute(
-                """
-                INSERT INTO auctions (
-                    url, title, year, make, model, original_owner,
-                    mileage, sold_price, sold_date, status, excerpt
-                )
-                VALUES (
-                    $1,$2,$3,$4,$5,$6,
-                    $7,$8,$9,$10,$11
-                )
-                ON CONFLICT (url) DO NOTHING;
-            """,
-                r["url"],
-                r["title"],
-                r["year"],
-                r["make"],
-                r["model"],
-                r["original_owner"],
-                r["mileage"] if r["mileage"] is not None else None,  # NULL if missing
-                r["sold_price"],
-                r["sold_date"],
-                r["status"],
-                r["excerpt"],
-            )
-    finally:
-        await conn.close()
 
 
 async def main():

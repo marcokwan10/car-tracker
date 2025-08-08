@@ -6,8 +6,28 @@ import re
 import time
 from aiohttp import ClientTimeout
 import aiohttp
+import asyncpg
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+from dotenv import load_dotenv
+
+# Load environment variables (for DB_* and GOOGLE_API_KEY)
+load_dotenv()
+
+# Configure Google Generative AI (Gemini)
+GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
+if GENAI_API_KEY:
+    genai.configure(api_key=GENAI_API_KEY)
+else:
+    print("WARNING: GOOGLE_API_KEY not set; AI make/model fallback is disabled.")
+
+DB_CONFIG = {
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "database": os.getenv("DB_NAME"),
+    "host": os.getenv("DB_HOST"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+}
 
 KNOWN_MAKES = [
     # Multi-word and longer names prioritized
@@ -80,7 +100,8 @@ KNOWN_MAKES = [
     "Nissan",
     "Opel",
     "Peugeot",
-    "Plymouth" "Polestar",
+    "Plymouth",
+    "Polestar",
     "Pontiac",
     "Porsche",
     "Ram",
@@ -109,9 +130,7 @@ KNOWN_MAKES = [
     "Aprilia",
     "Benelli",
     "Bimota",
-    "BMW Motorrad",
     "Ducati",
-    "Harley-Davidson",
     "Hero MotoCorp",
     "Husqvarna",
     "Indian",
@@ -130,11 +149,34 @@ KNOWN_MAKES = [
     "BSA",
 ]
 
+# Sort by descending length so multi-word names are prioritized when matching
+KNOWN_MAKES.sort(key=len, reverse=True)
+
 # Normalize sub-brands or alternate names to canonical make
 MAKE_NORMALIZATION = {
     "Mercedes-AMG": "Mercedes-Benz",
     "GMA": "Gordon Murray Automotive",
 }
+
+
+# ---------- Health check ----------
+def log_health() -> None:
+    """
+    Print a one-line health summary at startup:
+    - Whether Gemini is configured
+    - Current RPM throttle & interval
+    - Target DB host:port and database name
+    """
+    print("=== Startup Health Check ===")
+    print(f"Gemini configured: {bool(GENAI_API_KEY)}")
+    if GENAI_API_KEY:
+        print(f"Gemini RPM limit: {_GEMINI_RATE_LIMIT_RPM} req/min | interval: {_gemini_interval:.4f}s")
+    db_host = DB_CONFIG.get("host")
+    db_port = DB_CONFIG.get("port")
+    db_name = DB_CONFIG.get("database")
+    print(f"DB target: {db_name}@{db_host}:{db_port}")
+    print("============================")
+
 
 # Cache AI results to avoid duplicate API calls
 _ai_make_model_cache: dict[str, tuple[str, str] | None] = {}
@@ -165,7 +207,6 @@ async def split_make_model(raw_title: str) -> tuple[str, str]:
     raw_title = e.g. "2021 Land Rover Range Rover Evoque"
     returns ("Land Rover", "Range Rover Evoque")
     """
-
     # Remove common non-make prefixes
     title = re.sub(
         r"^(One-Owner|Original-Owner|Modified|Supercharged|Turbocharged|Custom|JDM)\s+",
@@ -197,6 +238,10 @@ async def ai_extract_make_model(raw_title: str) -> tuple[str, str]:
     """
     global _ai_fallback_count
     _ai_fallback_count += 1
+    # Early exit if Gemini isn’t configured
+    if not GENAI_API_KEY:
+        _ai_make_model_cache[raw_title] = (None, None)
+        return None, None
     # Return cached result if available
     if raw_title in _ai_make_model_cache:
         return _ai_make_model_cache[raw_title] or (None, None)
@@ -351,3 +396,48 @@ def parse_sold_date(date_str):
         except ValueError:
             continue
     return None
+
+
+async def save_to_db(records):
+    conn = await asyncpg.connect(**DB_CONFIG)
+    try:
+        for r in records:
+            await conn.execute(
+                """
+                INSERT INTO auction (
+                    source, source_listing_id, url, title, year, make, model, original_owner,
+                    mileage, sold_price, sold_date, status, excerpt
+                )
+                VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,
+                    $9,$10,$11,$12,$13
+                )
+                ON CONFLICT (source, source_listing_id) DO UPDATE
+                SET url=$3,
+                    title=$4,
+                    year=$5,
+                    make=$6,
+                    model=$7,
+                    original_owner=$8,
+                    mileage=COALESCE(EXCLUDED.mileage, auction.mileage),
+                    sold_price=COALESCE(EXCLUDED.sold_price, auction.sold_price),
+                    sold_date=COALESCE(EXCLUDED.sold_date, auction.sold_date),
+                    status=COALESCE(EXCLUDED.status, auction.status),
+                    excerpt=EXCLUDED.excerpt;
+            """,
+                r.get("source"),
+                r.get("source_listing_id"),
+                r.get("url"),
+                r.get("title"),
+                r.get("year"),
+                r.get("make"),
+                r.get("model"),
+                r.get("original_owner"),
+                r.get("mileage") if r.get("mileage") is not None else None,
+                r.get("sold_price"),
+                r.get("sold_date"),
+                r.get("status"),
+                r.get("excerpt"),
+            )
+    finally:
+        await conn.close()
