@@ -10,14 +10,37 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 
 from bat_util import (
-    _ai_fallback_count,
+    get_ai_fallback_count,
     split_make_model,
     extract_mileage,
     extract_mileage_from_detail_page,
     extract_price_and_status,
     parse_sold_date,
     save_to_db,
+    log_health,
 )
+
+
+def _extract_source_listing_id(listing_tag) -> str | None:
+    """Extract BaT's numeric listing ID from the list-card anchor.
+    Tries `data-pusher="post;list;<id>"` first, then falls back to `data-watch-url` query param `listing=<id>`.
+    """
+    # 1) data-pusher="post;list;94414872"
+    pusher = listing_tag.get("data-pusher")
+    if pusher:
+        parts = pusher.split(";")
+        if parts and parts[-1].isdigit():
+            return parts[-1]
+
+    # 2) data-watch-url contains ...listing=<id>
+    watch_el = listing_tag.select_one("[data-watch-url]")
+    if watch_el:
+        watch_url = watch_el.get("data-watch-url", "")
+        m = re.search(r"[?&]listing=(\d+)", watch_url)
+        if m:
+            return m.group(1)
+
+    return None
 
 
 async def parse_vehicle_listing(listing, session: aiohttp.ClientSession):
@@ -26,6 +49,10 @@ async def parse_vehicle_listing(listing, session: aiohttp.ClientSession):
     excerpt_el = listing.select_one(".item-excerpt")
     excerpt = excerpt_el.text.strip() if excerpt_el else ""
     url = listing.get("href")
+
+    # --- Source & source ID (for DB natural key) ---
+    source = "bat"
+    source_listing_id = _extract_source_listing_id(listing)
 
     # --- Extract year ---
     year_match = re.search(r"(?:19\d{2}|20\d{2})", title)
@@ -57,6 +84,8 @@ async def parse_vehicle_listing(listing, session: aiohttp.ClientSession):
     price, status = extract_price_and_status(result_text)
 
     return {
+        "source": source,
+        "source_listing_id": source_listing_id,
         "url": url,
         "title": title,
         "year": year,
@@ -91,18 +120,7 @@ async def scrape_bring_a_trailer(url: str, max_clicks: int = 400):
             current_count = len(current_listings)
 
             # Find the completed auctions 'Show More' button
-            show_more_selectors = [
-                # ".auctions-container.column-limited-width .auctions-footer-button",  # for all auction result
-                ".auctions-footer .auctions-footer-content .auctions-footer-button",  # for all auction result
-                ".auctions-completed.page-section .button-show-more",  # for individual model auction result
-            ]
-
-            show_more = None
-            for selector in show_more_selectors:
-                show_more = await page.query_selector(selector)
-                # Ensure it's visible
-                if show_more and await show_more.is_visible():
-                    break
+            show_more = await page.query_selector(".auctions-completed.page-section .button.button-show-more")
 
             if not show_more:
                 print("No visible 'Show More' button found. Stopping.")
@@ -133,14 +151,19 @@ async def scrape_bring_a_trailer(url: str, max_clicks: int = 400):
     # Parse the listings
     soup = BeautifulSoup(content, "html.parser")
     listings = soup.select("a.listing-card")
-    if max_clicks == 200:
-        listings.clear
+
     print(f"Total listings found: {len(listings)}")
 
-    # Open aiohttp session for detail page mileage lookup
-    async with aiohttp.ClientSession() as session:
-        # Run detail page parsing concurrently for speed
-        tasks = [parse_vehicle_listing(listing, session) for listing in listings]
+    connector = aiohttp.TCPConnector(limit=int(os.getenv("DETAIL_HTTP_LIMIT", "12")))
+    timeout = ClientTimeout(total=float(os.getenv("DETAIL_SESSION_TIMEOUT", "30")))
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        sem = asyncio.Semaphore(int(os.getenv("DETAIL_CONCURRENCY", "8")))
+
+        async def _parse_with_sem(node):
+            async with sem:
+                return await parse_vehicle_listing(node, session)
+
+        tasks = [_parse_with_sem(listing) for listing in listings]
         parsed_list = await asyncio.gather(*tasks)
         for parsed in parsed_list:
             if parsed:
@@ -150,11 +173,13 @@ async def scrape_bring_a_trailer(url: str, max_clicks: int = 400):
 
 
 async def main():
-    url = "https://bringatrailer.com/honda/s2000/"
+    # Health check: Gemini config, RPM throttle, DB target
+    log_health()
+    url = "https://bringatrailer.com/porsche/997-911/"
     results = await scrape_bring_a_trailer(url)
 
     # Log how many times AI fallback was used
-    print(f"AI fallback used {_ai_fallback_count} times")
+    print(f"AI fallback used {get_ai_fallback_count()} times")
 
     print(f"Scraped {len(results)} listings")
     if results:

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import random
 from aiohttp import ClientTimeout
 import aiohttp
 import asyncpg
@@ -15,11 +16,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configure Google Generative AI (Gemini)
-GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
-if GENAI_API_KEY:
-    genai.configure(api_key=GENAI_API_KEY)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 else:
-    print("WARNING: GOOGLE_API_KEY not set; AI make/model fallback is disabled.")
+    print("WARNING: GEMINI_API_KEY not set; AI make/model fallback is disabled.")
 
 DB_CONFIG = {
     "user": os.getenv("DB_USER"),
@@ -27,6 +28,17 @@ DB_CONFIG = {
     "database": os.getenv("DB_NAME"),
     "host": os.getenv("DB_HOST"),
     "port": int(os.getenv("DB_PORT", 5432)),
+}
+
+# Detail page fetch tuning
+DETAIL_MAX_RETRIES = int(os.getenv("DETAIL_MAX_RETRIES", "3"))
+DETAIL_TIMEOUT = float(os.getenv("DETAIL_TIMEOUT", "20"))  # seconds
+DETAIL_BACKOFF_BASE = float(os.getenv("DETAIL_BACKOFF_BASE", "1.8"))
+
+DEFAULT_HEADERS = {
+    "User-Agent": os.getenv("SCRAPER_USER_AGENT", "car-tracker/1.0 (+https://example.com)"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 KNOWN_MAKES = [
@@ -168,8 +180,8 @@ def log_health() -> None:
     - Target DB host:port and database name
     """
     print("=== Startup Health Check ===")
-    print(f"Gemini configured: {bool(GENAI_API_KEY)}")
-    if GENAI_API_KEY:
+    print(f"Gemini configured: {bool(GEMINI_API_KEY)}")
+    if GEMINI_API_KEY:
         print(f"Gemini RPM limit: {_GEMINI_RATE_LIMIT_RPM} req/min | interval: {_gemini_interval:.4f}s")
     db_host = DB_CONFIG.get("host")
     db_port = DB_CONFIG.get("port")
@@ -182,12 +194,16 @@ def log_health() -> None:
 _ai_make_model_cache: dict[str, tuple[str, str] | None] = {}
 
 # Rate limiting parameters for Gemini (requests per minute)
-_GEMINI_RATE_LIMIT_RPM = int(os.getenv("GEMINI_RATE_LIMIT_RPM", "3500"))
+_GEMINI_RATE_LIMIT_RPM = int(os.getenv("GEMINI_RATE_LIMIT_RPM"))
 _gemini_interval = 60.0 / _GEMINI_RATE_LIMIT_RPM
 _gemini_last_call = 0.0
 
 # Count how many times AI fallback is invoked
 _ai_fallback_count = 0
+
+
+def get_ai_fallback_count() -> int:
+    return _ai_fallback_count
 
 
 async def _throttle_gemini_call():
@@ -239,7 +255,7 @@ async def ai_extract_make_model(raw_title: str) -> tuple[str, str]:
     global _ai_fallback_count
     _ai_fallback_count += 1
     # Early exit if Gemini isn’t configured
-    if not GENAI_API_KEY:
+    if not GEMINI_API_KEY:
         _ai_make_model_cache[raw_title] = (None, None)
         return None, None
     # Return cached result if available
@@ -343,16 +359,51 @@ def extract_mileage(text: str) -> int | None:
 async def extract_mileage_from_detail_page(session: aiohttp.ClientSession, url: str):
     """
     Extract mileage from the 'Listing Details' section of a vehicle page.
+    Uses limited retries with backoff and identifies only list items that mention miles.
     """
-    try:
-        # Use a 10-second timeout for detail page requests
-        async with session.get(url, timeout=ClientTimeout(total=10)) as response:
-            html = await response.text()
-    except aiohttp.client_exceptions.TooManyRedirects:
-        print(f"Skipping detail page due to redirect loop: {url}")
-        return None
-    except asyncio.TimeoutError:
-        print(f"Skipping detail page due to timeout: {url}")
+    html = None
+    for attempt in range(DETAIL_MAX_RETRIES):
+        try:
+            async with session.get(
+                url,
+                timeout=ClientTimeout(total=DETAIL_TIMEOUT),
+                headers=DEFAULT_HEADERS,
+            ) as response:
+                # Handle transient server / rate limiting responses
+                if response.status in (429, 500, 502, 503, 504):
+                    delay = min(DETAIL_BACKOFF_BASE**attempt, 10.0) + random.uniform(0, 0.5)
+                    if attempt == DETAIL_MAX_RETRIES - 1:
+                        print(f"Skipping detail page due to HTTP {response.status}: {url}")
+                        return None
+                    await asyncio.sleep(delay)
+                    continue
+                if response.status == 403:
+                    # Might be a temporary block; short delay then retry
+                    delay = 2.0 + attempt
+                    if attempt == DETAIL_MAX_RETRIES - 1:
+                        print(f"Skipping detail page due to HTTP 403: {url}")
+                        return None
+                    await asyncio.sleep(delay)
+                    continue
+
+                response.raise_for_status()
+                html = await response.text()
+                break
+        except aiohttp.client_exceptions.TooManyRedirects:
+            print(f"Skipping detail page due to redirect loop: {url}")
+            return None
+        except asyncio.TimeoutError:
+            if attempt == DETAIL_MAX_RETRIES - 1:
+                print(f"Skipping detail page due to timeout: {url}")
+                return None
+            await asyncio.sleep(min(DETAIL_BACKOFF_BASE**attempt, 8.0))
+        except aiohttp.ClientError as e:
+            if attempt == DETAIL_MAX_RETRIES - 1:
+                print(f"Skipping detail page due to client error: {e}: {url}")
+                return None
+            await asyncio.sleep(min(DETAIL_BACKOFF_BASE**attempt, 8.0))
+
+    if not html:
         return None
 
     soup = BeautifulSoup(html, "html.parser")
@@ -377,7 +428,6 @@ async def extract_mileage_from_detail_page(session: aiohttp.ClientSession, url: 
     # Only parse items explicitly mentioning mileage
     for li in ul.find_all("li"):
         text = li.get_text(strip=True)
-        # Only parse items explicitly mentioning mileage
         if "mile" not in text.lower():
             continue
         mileage = extract_mileage(text)

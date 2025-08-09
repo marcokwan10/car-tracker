@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 
 from bat_util import (
+    _ai_fallback_count,
     split_make_model,
     extract_mileage,
     extract_mileage_from_detail_page,
@@ -114,6 +115,9 @@ async def main():
 
             print(f"Page {currentPage}: fetched {len(listings)} items, {len(all_records)} total parsed")
             currentPage += 1
+
+    # Log how many times AI fallback was used
+    print(f"AI fallback used {_ai_fallback_count} times")
 
     if all_records:
         await save_to_db(all_records)
