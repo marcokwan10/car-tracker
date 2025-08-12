@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 
 from bat_util import (
-    _ai_fallback_count,
+    get_ai_fallback_count,
     split_make_model,
     extract_mileage,
     extract_mileage_from_detail_page,
@@ -16,13 +16,21 @@ from bat_util import (
 )
 
 
-async def fetch_json_page(session: aiohttp.ClientSession, url: str, page: int, per_page: int = 60):
+async def fetch_json_page(
+    session: aiohttp.ClientSession,
+    url: str,
+    page: int,
+    per_page: int,
+    year: int,
+):
     params = {
         "page": page,
         "per_page": per_page,
         "get_items": 1,
         "get_stats": 0,
         "sort": "td",
+        "minimum_year": year,
+        "maximum_year": year,
     }
     headers = {"Accept": "application/json"}
     async with session.get(url, params=params, headers=headers) as resp:
@@ -30,7 +38,7 @@ async def fetch_json_page(session: aiohttp.ClientSession, url: str, page: int, p
         return await resp.json()
 
 
-async def parse_json_listing(item, session: aiohttp.ClientSession):
+async def parse_json_listing(item, session: aiohttp.ClientSession, filter_year: int | None = None):
     # 1. Grab the title & excerpt
     title = item.get("title", "").strip()
     excerpt = item.get("excerpt", "").strip()
@@ -38,7 +46,7 @@ async def parse_json_listing(item, session: aiohttp.ClientSession):
 
     # 2. Year
     match = re.search(r"(?:19|20)\d{2}", title)
-    year = int(match.group()) if match else None
+    year = int(match.group()) if match else (filter_year if filter_year is not None else None)
     if not year:
         return None  # Skip listing with no year
 
@@ -85,43 +93,63 @@ async def parse_json_listing(item, session: aiohttp.ClientSession):
     }
 
 
+# Helper to parse a list of listings with error handling
+async def parse_listings(listings, session, filter_year):
+    tasks = [parse_json_listing(item, session, filter_year=filter_year) for item in listings]
+    parsed_list = await asyncio.gather(*tasks, return_exceptions=True)
+    results = []
+    for result in parsed_list:
+        if isinstance(result, Exception):
+            print(f"parse_json_listing error: {result}")
+            continue
+        if result:
+            results.append(result)
+    return results
+
+
 async def main():
     # Log startup health once
     log_health()
 
     API_URL = "https://bringatrailer.com/wp-json/bringatrailer/1.0/data/listings-filter"
 
-    all_records = []
-    pageLimit = 200
-    currentPage = 166
-    async with aiohttp.ClientSession() as session:
-        while currentPage < pageLimit:
-            data = await fetch_json_page(session, API_URL, currentPage)
-            listings = data.get("items", [])
+    year = 1980
+    result_per_page = 60
 
-            if not listings:
-                print(f"No listings on page {currentPage}; stopping.")
-                break
+    while year < 1990:
+        all_records = []
+        async with aiohttp.ClientSession() as session:
+            # Fetch page 1 to learn total pages for this year
+            data_p1 = await fetch_json_page(session, API_URL, page=1, per_page=result_per_page, year=year)
+            pages_total = data_p1.get("pages_total") or 1
+            items_total = data_p1.get("items_total") or 0
+            print(f"[{year}] pages_total={pages_total} items_total={items_total}")
 
-            # Concurrently parse each JSON item using the same session
-            tasks = [parse_json_listing(item, session) for item in listings]
-            parsed_list = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in parsed_list:
-                if isinstance(result, Exception):
-                    print(f"parse_json_listing error: {result}")
-                    continue
-                if result:
-                    all_records.append(result)
+            # Iterate over all pages, reusing the first page response
+            for page_num in range(1, int(pages_total) + 1):
+                if page_num == 1:
+                    data = data_p1
+                else:
+                    await asyncio.sleep(0.1)  # small politeness delay
+                    data = await fetch_json_page(session, API_URL, page=page_num, per_page=result_per_page, year=year)
 
-            print(f"Page {currentPage}: fetched {len(listings)} items, {len(all_records)} total parsed")
-            currentPage += 1
+                listings = data.get("items", [])
+                if not listings and page_num > 1:
+                    print(f"[{year}] No listings on page {page_num}; stopping early.")
+                    break
 
-    # Log how many times AI fallback was used
-    print(f"AI fallback used {_ai_fallback_count} times")
+                parsed = await parse_listings(listings, session, filter_year=year)
+                all_records.extend(parsed)
+                print(f"[{year}] Page {page_num}: fetched {len(listings)} items, {len(all_records)} total parsed")
 
-    if all_records:
-        await save_to_db(all_records)
-        print(f"Saved {len(all_records)} records to the database.")
+        # Log how many times AI fallback was used (live count)
+        print(f"AI fallback used {get_ai_fallback_count()} times")
+
+        if all_records:
+            await save_to_db(all_records)
+            print(f"Saved {len(all_records)} records to the database.")
+
+        year += 1
 
 
 if __name__ == "__main__":
