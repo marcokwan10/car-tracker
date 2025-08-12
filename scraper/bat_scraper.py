@@ -43,6 +43,35 @@ def _extract_source_listing_id(listing_tag) -> str | None:
     return None
 
 
+async def _collect_card_hrefs(page):
+    """Return a set of absolute hrefs for visible listing cards under Past Auctions."""
+    return set(
+        await page.evaluate(
+            """() => {
+                const root = document.querySelector('.auctions-completed.page-section') || document;
+                const as = Array.from(root.querySelectorAll('a.listing-card[href]'));
+                const hrefs = [];
+                for (const a of as) {
+                    try { hrefs.push(new URL(a.href, location.href).href); } catch {}
+                }
+                return Array.from(new Set(hrefs));
+            }"""
+        )
+    )
+
+
+async def _get_show_more_btn(page):
+    """Locate the Past Auctions Show More button and return its Locator or None."""
+    selector = ".auctions-completed.page-section div.items-more button.button-show-more"
+    loc = page.locator(selector)
+    cnt = await loc.count()
+    for i in range(min(cnt, 3)):
+        btn = loc.nth(i)
+        if await btn.is_visible():
+            return btn
+    return None
+
+
 async def parse_vehicle_listing(listing, session: aiohttp.ClientSession):
     title_el = listing.select_one("h3")
     title = title_el.text.strip() if title_el else ""
@@ -110,34 +139,103 @@ async def scrape_bring_a_trailer(url: str, max_clicks: int = 400):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
+        await page.set_viewport_size({"width": 1280, "height": 2000})
         await page.goto(url, timeout=60000)
+        # Try to jump to Past Auctions tab/anchor so the right container renders
+        try:
+            tab = page.locator("a[href$='#past-auctions']").first
+            if await tab.count() > 0:
+                await tab.click()
+                await page.wait_for_timeout(300)
+            else:
+                await page.evaluate(
+                    "document.getElementById('past-auctions')?.scrollIntoView({behavior:'instant',block:'start'})"
+                )
+                await page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+        # Track unique card hrefs to detect real growth even if the DOM reorders
+        prev_hrefs = await _collect_card_hrefs(page)
 
         click_count = 0
 
         while click_count < max_clicks:
-            # Count current listings
-            current_listings = await page.query_selector_all("a.listing-card")
-            current_count = len(current_listings)
+            # Ensure lazy containers render
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(250)
 
-            # Find the completed auctions 'Show More' button
-            show_more = await page.query_selector(".auctions-completed.page-section .button.button-show-more")
-
-            if not show_more:
+            btn = await _get_show_more_btn(page)
+            if not btn:
                 print("No visible 'Show More' button found. Stopping.")
                 break
 
-            try:
-                # Scroll into view and click
-                await show_more.scroll_into_view_if_needed()
-                await show_more.click()
-                click_count += 1
-                print(f"Clicked 'Show More' #{click_count}, current listings: {current_count}")
+            prev_count = len(prev_hrefs)
 
-                # Wait for the next listing to appear after click
+            try:
+                # Click once
+                await btn.scroll_into_view_if_needed()
+                await btn.click()
+                click_count += 1
+                print(f"Clicked 'Show More' #{click_count}, previous listings: {prev_count}")
+
+                # Observe loading text flip if present (best-effort)
+                loading_span = page.locator(
+                    ".auctions-completed.page-section div.items-more button.button-show-more span",
+                    has_text="Loading more auctions",
+                )
                 try:
-                    await page.wait_for_selector(f"a.listing-card:nth-child({current_count+1})", timeout=20000)
-                except:
-                    print("No new listings detected after clicking. Stopping.")
+                    await loading_span.wait_for(state="visible", timeout=3000)
+                except Exception:
+                    pass
+                try:
+                    await loading_span.wait_for(state="hidden", timeout=12000)
+                except Exception:
+                    pass
+
+                # Wait for the listings API/network to return (best-effort)
+                try:
+                    await page.wait_for_response(lambda r: "listings-filter" in r.url and r.ok, timeout=12000)
+                except Exception:
+                    pass
+
+                # Poll for DOM growth: new count or new href
+                increased = False
+                for _ in range(60):  # ~15s at 250ms
+                    await page.wait_for_timeout(250)
+                    hrefs = await _collect_card_hrefs(page)
+                    if len(hrefs) > prev_count or len(hrefs - prev_hrefs) > 0:
+                        prev_hrefs = hrefs
+                        print(f"Listings increased to {len(prev_hrefs)}")
+                        increased = True
+                        break
+                    # keep nudging bottom to trigger lazy-loads
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+                if increased:
+                    continue
+
+                # Second chance: reacquire button and click again once
+                btn = await _get_show_more_btn(page)
+                if not btn:
+                    print("Show More button disappeared; stopping.")
+                    break
+                await btn.scroll_into_view_if_needed()
+                await btn.click()
+                print("No increase detected; retried click once.")
+
+                for _ in range(60):
+                    await page.wait_for_timeout(250)
+                    hrefs = await _collect_card_hrefs(page)
+                    if len(hrefs) > prev_count or len(hrefs - prev_hrefs) > 0:
+                        prev_hrefs = hrefs
+                        print(f"Listings increased to {len(prev_hrefs)}")
+                        increased = True
+                        break
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+                if not increased:
+                    print("No new listings detected after clicking (even after retry). Stopping.")
                     break
 
             except Exception as e:
@@ -175,7 +273,7 @@ async def scrape_bring_a_trailer(url: str, max_clicks: int = 400):
 async def main():
     # Health check: Gemini config, RPM throttle, DB target
     log_health()
-    url = "https://bringatrailer.com/porsche/997-911/"
+    url = "https://bringatrailer.com/porsche/911/?yearTo=2000"
     results = await scrape_bring_a_trailer(url)
 
     # Log how many times AI fallback was used
