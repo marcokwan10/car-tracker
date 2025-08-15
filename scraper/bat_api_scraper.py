@@ -6,6 +6,7 @@ from datetime import datetime
 
 from bat_util import (
     get_ai_fallback_count,
+    reset_ai_fallback_count,
     split_make_model,
     extract_mileage,
     extract_mileage_from_detail_page,
@@ -13,6 +14,7 @@ from bat_util import (
     parse_sold_date,
     save_to_db,
     log_health,
+    ai_identify_transmission,
 )
 
 
@@ -76,6 +78,15 @@ async def parse_json_listing(item, session: aiohttp.ClientSession, filter_year: 
         if isinstance(ts, (int, float)):
             sold_date = datetime.fromtimestamp(ts).date()
 
+    # 7. Transmission (AI). ai_identify_transmission returns True for AUTOMATIC, False for MANUAL
+    manual = None
+    try:
+        auto_flag = await ai_identify_transmission(title, excerpt)
+        if auto_flag is not None:
+            manual = not auto_flag  # store True for manual cars
+    except Exception:
+        manual = None
+
     return {
         "source": "bat",
         "source_listing_id": str(item.get("id")) if item.get("id") is not None else None,
@@ -90,6 +101,7 @@ async def parse_json_listing(item, session: aiohttp.ClientSession, filter_year: 
         "sold_date": sold_date,
         "status": status,
         "excerpt": excerpt,
+        "manual": manual,
     }
 
 
@@ -113,10 +125,11 @@ async def main():
 
     API_URL = "https://bringatrailer.com/wp-json/bringatrailer/1.0/data/listings-filter"
 
-    year = 1980
+    year = 1950
     result_per_page = 60
+    total_ai_fallbacks = 0
 
-    while year < 1990:
+    while year < 1980:
         all_records = []
         async with aiohttp.ClientSession() as session:
             # Fetch page 1 to learn total pages for this year
@@ -144,12 +157,16 @@ async def main():
 
         # Log how many times AI fallback was used (live count)
         print(f"AI fallback used {get_ai_fallback_count()} times")
+        total_ai_fallbacks += get_ai_fallback_count()
+        reset_ai_fallback_count()
 
         if all_records:
             await save_to_db(all_records)
             print(f"Saved {len(all_records)} records to the database.")
 
         year += 1
+
+    print(f"Total AI fallbacks across all years: {total_ai_fallbacks}")
 
 
 if __name__ == "__main__":

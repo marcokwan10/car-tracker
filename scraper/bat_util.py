@@ -12,6 +12,11 @@ from bs4 import BeautifulSoup
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+# --- Perf helpers ---
+from time import perf_counter
+from dataclasses import dataclass
+from typing import Dict
+
 # Load environment variables (for DB_* and GOOGLE_API_KEY)
 load_dotenv()
 
@@ -171,6 +176,76 @@ MAKE_NORMALIZATION = {
 }
 
 
+# ---------------- Performance instrumentation ----------------
+@dataclass
+class PerfStat:
+    count: int = 0
+    total: float = 0.0
+    max: float = 0.0
+    min: float = float("inf")
+
+
+_perf_stats: Dict[str, PerfStat] = {}
+
+
+def _record_perf(label: str, dt: float) -> None:
+    st = _perf_stats.get(label)
+    if st is None:
+        st = PerfStat()
+        _perf_stats[label] = st
+    st.count += 1
+    st.total += dt
+    if dt > st.max:
+        st.max = dt
+    if dt < st.min:
+        st.min = dt
+
+
+class PerfTimer:
+    def __init__(self, label: str):
+        self.label = label
+        self._t0 = 0.0
+
+    def __enter__(self):
+        self._t0 = perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _record_perf(self.label, perf_counter() - self._t0)
+
+
+# Context helper: use as `with perf("phase.name"):`
+def perf(label: str) -> PerfTimer:
+    return PerfTimer(label)
+
+
+def async_timed(label: str):
+    """Decorator for async functions to record wall-clock duration per call."""
+
+    def _wrap(fn):
+        async def _inner(*args, **kwargs):
+            t0 = perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                _record_perf(label, perf_counter() - t0)
+
+        return _inner
+
+    return _wrap
+
+
+def print_perf_summary() -> None:
+    if not _perf_stats:
+        print("=== Perf Summary ===\n(no samples)\n====================")
+        return
+    print("=== Perf Summary ===")
+    for label, st in sorted(_perf_stats.items()):
+        avg = (st.total / st.count) if st.count else 0.0
+        print(f"{label:28s} n={st.count:5d} avg={avg*1000:.1f}ms min={st.min*1000:.1f}ms max={st.max*1000:.1f}ms")
+    print("====================")
+
+
 # ---------- Health check ----------
 def log_health() -> None:
     """
@@ -193,10 +268,27 @@ def log_health() -> None:
 # Cache AI results to avoid duplicate API calls
 _ai_make_model_cache: dict[str, tuple[str, str] | None] = {}
 
+
 # Rate limiting parameters for Gemini (requests per minute)
-_GEMINI_RATE_LIMIT_RPM = int(os.getenv("GEMINI_RATE_LIMIT_RPM"))
-_gemini_interval = 60.0 / _GEMINI_RATE_LIMIT_RPM
+_GEMINI_RATE_LIMIT_RPM = int(os.getenv("GEMINI_RATE_LIMIT_RPM", "1200"))  # safe default if unset
+_gemini_interval = 60.0 / max(1, _GEMINI_RATE_LIMIT_RPM)
 _gemini_last_call = 0.0
+
+
+def get_gemini_rpm() -> int:
+    return _GEMINI_RATE_LIMIT_RPM
+
+
+def suggest_ai_concurrency(target_latency_s: float = 0.25, overprovision: float = 1.5, cap: int = 128) -> int:
+    """
+    Suggest a reasonable asyncio concurrency for AI calls given the RPM throttle.
+    Formula: concurrency ≈ RPS * target_latency * overprovision, clamped to [8, cap].
+    With RPM=4000 (≈66.7 rps) and 250ms latency, this yields ~25; with 1.5x overprovision ≈ 38.
+    """
+    rps = get_gemini_rpm() / 60.0
+    conc = int(max(8, min(cap, rps * max(0.05, target_latency_s) * max(1.0, overprovision))))
+    return conc
+
 
 # Count how many times AI fallback is invoked
 _ai_fallback_count = 0
@@ -204,6 +296,11 @@ _ai_fallback_count = 0
 
 def get_ai_fallback_count() -> int:
     return _ai_fallback_count
+
+
+def reset_ai_fallback_count() -> None:
+    global _ai_fallback_count
+    _ai_fallback_count = 0
 
 
 async def _throttle_gemini_call():
@@ -262,7 +359,7 @@ async def ai_extract_make_model(raw_title: str) -> tuple[str, str]:
     if raw_title in _ai_make_model_cache:
         return _ai_make_model_cache[raw_title] or (None, None)
     model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash-lite",
+        model_name="gemini-2.5-flash-lite",
         generation_config={"response_mime_type": "application/json"},
     )
     prompt = f"""
@@ -293,6 +390,113 @@ async def ai_extract_make_model(raw_title: str) -> tuple[str, str]:
         print(f"An error occurred during Gemini API call: {e}")
         _ai_make_model_cache[raw_title] = (None, None)
         return None, None
+
+
+# ---------------- Gemini Transmission JSON Robust Parser -----------------
+def _parse_transmission_from_model_response(text: str) -> str | None:
+    """Return 'automatic' | 'manual' | None from a model text response.
+    Tries strict JSON first, then extracts the first JSON-looking block, then
+    falls back to keyword sniffing or bare string labels.
+    """
+    if not text:
+        return None
+
+    s = text.strip().strip("`")
+
+    # 1) Direct JSON parse (object or bare string)
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            val = obj.get("transmission")
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in ("automatic", "manual"):
+                    return v
+        elif isinstance(obj, str):
+            v = obj.strip().lower()
+            if v in ("automatic", "manual"):
+                return v
+    except Exception:
+        pass
+
+    # 2) Extract first {...} slice and try again
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = s[start : end + 1]
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                val = obj.get("transmission")
+                if isinstance(val, str):
+                    v = val.strip().lower()
+                    if v in ("automatic", "manual"):
+                        return v
+        except Exception:
+            pass
+
+    # 3) Bare word responses
+    if re.fullmatch(r'"?automatic"?', s, re.IGNORECASE):
+        return "automatic"
+    if re.fullmatch(r'"?manual"?', s, re.IGNORECASE):
+        return "manual"
+
+    # 4) Keyword sniffing (only if exactly one appears)
+    has_auto = re.search(r"\bautomatic\b", s, re.IGNORECASE) is not None
+    has_manual = re.search(r"\bmanual\b", s, re.IGNORECASE) is not None
+    if has_auto ^ has_manual:
+        return "automatic" if has_auto else "manual"
+
+    return None
+
+
+@async_timed("ai.identify_transmission")
+async def ai_identify_transmission(raw_title: str, excerpt: str) -> bool | None:
+    """
+    Use Google Gemini to identify if the vehicle is automatic or manual.
+    Returns True for automatic, False for manual, None if not identified.
+    """
+    # Early exit if Gemini isn’t configured
+    if not GEMINI_API_KEY:
+        return None
+
+    model = genai.GenerativeModel(
+        model_name="gemini-2.5-flash-lite",
+        generation_config={"response_mime_type": "application/json"},
+    )
+
+    prompt = (
+        "You are an expert vehicle information extractor.\n"
+        "Determine whether the vehicle described below has an automatic or manual transmission.\n"
+        "Return exactly one of these JSON objects: "
+        '{"transmission":"automatic"} or {"transmission":"manual"}.\n'
+        'If unknown, return {"transmission":"unknown"}.\n\n'
+        f'Title: "{raw_title}"\n'
+        f'Excerpt: "{excerpt}"'
+    )
+
+    # Up to 3 attempts on transient failures or malformed JSON
+    for attempt in range(3):
+        try:
+            await _throttle_gemini_call()
+            response = await model.generate_content_async(prompt)
+            text = getattr(response, "text", None) or ""
+            label = _parse_transmission_from_model_response(text)
+            if label == "automatic":
+                return True
+            if label == "manual":
+                return False
+            # Unknown/malformed → retry with backoff (except after last attempt)
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (2**attempt))
+                continue
+            return None
+        except Exception as e:
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (2**attempt))
+                continue
+            print(f"An error occurred during Gemini API call: {e}")
+            return None
 
 
 def extract_price_and_status(text):
@@ -456,11 +660,11 @@ async def save_to_db(records):
                 """
                 INSERT INTO auction (
                     source, source_listing_id, url, title, year, make, model, original_owner,
-                    mileage, sold_price, sold_date, status, excerpt
+                    mileage, sold_price, sold_date, status, excerpt, manual
                 )
                 VALUES (
                     $1,$2,$3,$4,$5,$6,$7,$8,
-                    $9,$10,$11,$12,$13
+                    $9,$10,$11,$12,$13,$14
                 )
                 ON CONFLICT (source, source_listing_id) DO UPDATE
                 SET url=$3,
@@ -473,7 +677,8 @@ async def save_to_db(records):
                     sold_price=COALESCE(EXCLUDED.sold_price, auction.sold_price),
                     sold_date=COALESCE(EXCLUDED.sold_date, auction.sold_date),
                     status=COALESCE(EXCLUDED.status, auction.status),
-                    excerpt=EXCLUDED.excerpt;
+                    excerpt=EXCLUDED.excerpt,
+                    manual=COALESCE(EXCLUDED.manual, auction.manual);
             """,
                 r.get("source"),
                 r.get("source_listing_id"),
@@ -488,6 +693,7 @@ async def save_to_db(records):
                 r.get("sold_date"),
                 r.get("status"),
                 r.get("excerpt"),
+                r.get("manual"),
             )
     finally:
         await conn.close()
