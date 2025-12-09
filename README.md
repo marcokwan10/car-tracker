@@ -1,0 +1,1 @@
+A full data-tracking pipeline for car auction sites like Bring a triler or Cars $ Bids, including scraping, cleaning, storage, and upcoming features like visualization, trend analysis, and valuation insights.
